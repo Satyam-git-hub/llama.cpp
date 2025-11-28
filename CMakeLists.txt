@@ -95,6 +95,13 @@ option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
 option(LLAMA_HTTPLIB    "llama: if libcurl is disabled, use httplib to download model from an URL" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(LLAMA_SCHED_EXT  "llama: enable sched_ext phase hinting" OFF)
+
+if (LLAMA_SCHED_EXT)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBBPF REQUIRED IMPORTED_TARGET libbpf)
+    add_compile_definitions(LLAMA_SCHED_EXT)
+endif()
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -270,6 +277,9 @@ install(
         WORLD_EXECUTE
     DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+if (LLAMA_SCHED_EXT)
+    add_subdirectory(examples/scx_llm_phase)
+endif()
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         @ONLY)

@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "bpf_interface.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -2771,8 +2772,16 @@ int32_t llama_encode(
 }
 
 int32_t llama_decode(
-        llama_context * ctx,
-          llama_batch   batch) {
+        struct llama_context * ctx,
+          struct llama_batch   batch) {
+    static PhaseHinter hinter;
+    
+    // Hint the phase to the kernel scheduler
+    if (batch.n_tokens > 1) {
+        hinter.set_phase(PHASE_PREFILL);
+    } else {
+        hinter.set_phase(PHASE_DECODE);
+    }
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);

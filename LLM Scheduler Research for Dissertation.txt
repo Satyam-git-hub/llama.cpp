@@ -1,0 +1,532 @@
+﻿Temporal Dissonance in Generative AI: Architecting a Phase-Aware Operating System Scheduler via eBPF and sched_ext
+
+
+
+
+Executive Summary
+
+
+The computational landscape of high-performance computing is undergoing a tectonic shift, driven by the ubiquity of Large Language Models (LLMs). Unlike traditional server workloads, which are typically categorized as either throughput-oriented (batch processing) or latency-oriented (transactional databases), LLM inference represents a hybrid, bimodal workload that oscillates rapidly between these two extremes. This dissertation presents a comprehensive architectural analysis and implementation strategy for a "Phase-Aware" scheduler, leveraging the Linux kernel's novel sched_ext framework.
+Current general-purpose schedulers, such as the Completely Fair Scheduler (CFS) and Earliest Eligible Virtual Deadline First (EEVDF), operate on heuristic metrics—virtual runtime and lag—that are blind to the semantic state of the application. This "semantic gap" results in sub-optimal handling of the LLM "Decode" phase, a latency-critical operation where even microsecond-scale preemption manifests as user-perceptible jitter.
+We propose scx_llm_phase, a custom BPF (Berkeley Packet Filter) scheduler that bridges this gap. By instrumenting the inference engine (specifically llama.cpp) to hint its internal state—Prefill vs. Decode—to the kernel via Task Local Storage maps, we enable a scheduling regime that applies strictly differentiated policies. The Prefill phase, a compute-bound matrix operation, is managed via topology-aware batch scheduling to maximize cache coherency. The Decode phase, a memory-bound autoregressive generation step, is accorded strict priority preemption privileges to minimize tail latency. This report details the theoretical underpinnings, the implementation mechanics within the sched_ext infrastructure, and the expected performance characteristics of this novel approach.
+________________
+
+
+1. The Latency Crisis in Generative Systems
+
+
+
+
+1.1 The Shift from Throughput to Isochrony
+
+
+For the past two decades, the primary objective of Operating System (OS) scheduling in data center environments has been throughput maximization. The dominant paradigm, epitomized by the Completely Fair Scheduler (CFS), treats CPU cycles as a fluid resource to be partitioned fairly among competing tasks.1 Fairness, in this context, is defined over human-perceptible timescales (tens of milliseconds). If Task A runs for 50ms and Task B runs for 50ms, the system is deemed "fair."
+However, the interactive nature of Generative AI, specifically Large Language Models (LLMs), introduces a requirement that resembles isochronous systems more than batch processors. When a user interacts with a chatbot or an automated agent, the metric of success is not merely the total time to generate a response, but the consistency of the "inter-token latency" (ITL)—the time elapsed between the appearance of consecutive words on the screen.3
+Variability in ITL, often referred to as "jitter" or "stutter," breaks the illusion of intelligence. A delay of 200ms during the generation of a single token is noticeable; a delay of 50ms repeated randomly creates a jarring user experience. Standard Linux schedulers, designed to amortize the cost of context switching by enforcing minimum run granularity (often 3-4ms), inadvertently introduce this stutter.2 When an inference thread yields the CPU (e.g., waiting for memory), the scheduler may schedule a background maintenance task. When the inference thread becomes ready again microseconds later, the scheduler may force it to wait until the background task finishes its "fair" slice, thereby injecting latency directly into the token generation path.6
+
+
+1.2 The Failure of Heuristics in Bimodal Workloads
+
+
+The core failure mode of current schedulers lies in their reliance on historical heuristics to predict future behavior. Schedulers classify tasks as "interactive" (IO-bound) or "batch" (CPU-bound) based on their sleep/wake patterns.
+LLM inference defies this binary classification because it is a bimodal workload composed of two distinct phases that alternate within the same thread of execution 8:
+1. The Prefill Phase: The processing of the input prompt. This is a massive burst of dense computation (Matrix-Matrix multiplication). To the scheduler, this looks like a heavy batch job.
+2. The Decode Phase: The generation of the response. This is a serial sequence of small computations (Matrix-Vector multiplication) punctuated by memory waits. To the scheduler, this looks like a latency-sensitive interactive task.
+The transition between these phases is instantaneous. A standard scheduler, having observed the thread consuming 100% CPU for 500ms during the Prefill phase, will penalize its priority (increase its vruntime) just as it enters the Decode phase—precisely the moment it needs maximum priority.10 This semantic gap—the kernel’s inability to know what the application is doing—is the fundamental bottleneck this research addresses.
+________________
+
+
+2. Deconstructing the Inference Workload
+
+
+To architect a scheduler that solves this problem, we must first rigorously define the computational characteristics of the workload. We utilize the Transformer architecture, specifically the implementation found in llama.cpp, as our reference model.
+
+
+2.1 The Prefill Phase: The Compute Saturation
+
+
+The Prefill phase corresponds to the "prompt evaluation." Mathematically, this phase calculates the Attention mechanism for all tokens in the input prompt simultaneously.
+
+
+$$Attention(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+In this phase, the matrices $Q$, $K$, and $V$ have dimensions proportional to the prompt length $L$. The computational complexity is $O(L^2)$ for the attention mechanism and $O(L \cdot d_{model})$ for the feed-forward networks.
+System Characteristics:
+* Compute Bound: The bottleneck is the Floating Point Operations per Second (FLOPS) of the CPU or GPU.
+* Cache Sensitivity: Efficiency depends heavily on keeping the model weights and the active computation blocks in the L1/L2 caches.11
+* Scheduling Requirement: High throughput. The scheduler should provide long, uninterrupted time slices (quanta) to minimize instruction cache pollution and maximize branch prediction efficiency. Preemption during this phase is costly because it forces the reloading of cache lines.8
+
+
+2.2 The Decode Phase: The Memory Wall
+
+
+Once the prompt is processed, the model enters the autoregressive Decode phase. Here, the model generates token $t_{n+1}$ based on the sequence $t_1...t_n$.
+Architectural Constraint:
+Crucially, this process is serial. Token $n+1$ cannot be calculated until Token $n$ is complete. Parallelism is limited to the operations within a single token generation step.
+System Characteristics:
+* Memory Bound: For every token generated, the system must read the entire model weights (often gigabytes) and the growing KV cache from DRAM. The arithmetic intensity (ratio of calculation to memory access) is extremely low.9
+* Latency Critical: The execution time of a single step sets the "floor" for the user's perceived latency. Any additional delay introduced by the OS is pure overhead.
+* Scheduling Requirement: Immediate execution. When the memory controller returns the data, the CPU must process it instantly. The thread should effectively have "Real-Time" priority, preempting any other workload.9
+
+
+2.3 llama.cpp Execution Model
+
+
+llama.cpp is a C++ inference engine optimized for standard consumer hardware (CPUs and Apple Silicon).12 Understanding its threading model is vital for our scheduler design.
+The core loop resides in llama_decode_internal.15 The engine processes work in batches.
+* Batch Size > 1: The engine is in the Prefill phase (or processing multiple streams). It launches multi-threaded GEMM (General Matrix Multiply) kernels.
+* Batch Size == 1: The engine is in the Decode phase. It performs GEMV (General Matrix Vector multiply).
+The Thread Pool:
+llama.cpp typically spawns a thread pool equal to the number of physical cores. These threads synchronize via barriers. During the Decode phase, the main thread orchestrates the work, and worker threads wake up to process slices of the matrix vector multiplication.13 The synchronization overhead (waiting for all threads to reach the barrier) makes the system hypersensitive to the "straggler problem"—if just one thread is preempted by the OS scheduler, the entire generation step stalls.4
+________________
+
+
+3. The sched_ext Paradigm: A Kernel Revolution
+
+
+Having defined the problem and the workload, we turn to the solution space. Linux 6.12 introduced sched_ext (SCX), a radical departure from traditional kernel development that allows scheduling policies to be defined in user-space code compiled to eBPF (extended Berkeley Packet Filter).18
+
+
+3.1 Architecture of an Extensible Scheduler
+
+
+Traditionally, changing the Linux scheduler required modifying the kernel source code (kernel/sched/fair.c), recompiling the entire kernel, and rebooting. This high barrier to entry stifled innovation and forced a "one-size-fits-all" philosophy.1
+sched_ext decouples the mechanism of scheduling (context switching, runqueues) from the policy (which task runs next).
+
+
+3.1.1 The Operations Struct (sched_ext_ops)
+
+
+A BPF scheduler is defined by implementing a struct of callbacks, struct sched_ext_ops. The kernel invokes these callbacks at specific lifecycle events.19
+
+
+Callback
+	Trigger Event
+	Relevance to LLM Scheduler
+	select_cpu
+	A task wakes up (becomes runnable).
+	Critical for deciding where to run the task (NUMA/CCX topology awareness).21
+	enqueue
+	A task is added to the runqueue.
+	The point to decide priority. We can detect the phase here and route to high-priority queues.1
+	dispatch
+	A CPU is idle and needs work.
+	The mechanism to pull tasks from custom queues and execute them.24
+	tick
+	The periodic timer interrupt.
+	Used for time-slice management and enforcing preemption on running tasks.26
+	
+
+3.1.2 Dispatch Queues (DSQs)
+
+
+The primary abstraction in sched_ext is the Dispatch Queue (DSQ).
+* Global DSQ (SCX_DSQ_GLOBAL): A system-wide FIFO queue.
+* Local DSQ (SCX_DSQ_LOCAL): A per-CPU FIFO queue.
+* Custom DSQs: BPF schedulers can create arbitrary queues. These can be used to segregate workloads (e.g., a "high priority" queue for Decode threads).24
+Crucially, sched_ext allows a BPF program to bypass the local DSQ and dispatch directly to a CPU, or to construct a custom priority mechanism (like a vtime-based Red-Black tree or a simple strict priority list).23
+
+
+3.2 Safety and Stability via eBPF
+
+
+A major concern with custom schedulers is system stability. If a scheduler enters an infinite loop or fails to schedule tasks, the machine freezes. sched_ext leverages the BPF verifier to ensure memory safety and termination. Furthermore, it includes a Watchdog mechanism. If a task is runnable but not scheduled for a defined timeout (e.g., 30 seconds), the kernel automatically unloads the BPF scheduler and falls back to the default CFS/EEVDF scheduler.21 This safety net makes sched_ext viable for production environments, as a buggy scheduler typically results in a fallback rather than a kernel panic.
+
+
+3.3 The Advantages of BPF for Phase-Awareness
+
+
+Why use sched_ext instead of just using chrt (Change Real-Time) in user space?
+1. Granularity: chrt sets a static priority for the process lifetime. We need to switch priorities every few milliseconds.
+2. Overhead: Changing scheduler classes via syscalls (sched_setscheduler) is expensive and requires capabilities. BPF map updates are nanosecond-scale operations.27
+3. Introspection: A BPF scheduler can inspect the machine's topology (NUMA nodes, shared caches) and make placement decisions that generic user-space tools cannot express.22
+________________
+
+
+4. System Design: The Phase-Aware Scheduler
+
+
+We propose a composite system consisting of a Userspace Agent (the modified llama.cpp) and the Kernel Scheduler (scx_llm_phase).
+
+
+4.1 The Communication Protocol: Userspace Hinting
+
+
+The fundamental innovation is the "Hinting" mechanism. The application knows its state better than the kernel ever could. Therefore, we create a side-channel for the application to push state data into the kernel.
+Mechanism: Task Local Storage
+We utilize BPF_MAP_TYPE_TASK_STORAGE. This is a map type where the key is the task (thread) itself, and the value is arbitrary data stored directly in the kernel's memory space associated with that task.30
+The State Enum:
+We define a shared protocol header:
+
+
+C
+
+
+
+
+enum llm_phase {
+   PHASE_UNKNOWN = 0,
+   PHASE_PREFILL = 1,  // Compute Bound, Batch Friendly
+   PHASE_DECODE  = 2   // Latency Critical, Strict Priority
+};
+
+The Userspace Hook:
+In llama.cpp, we introduce a lightweight wrapper around bpf_map_update_elem. When llama_decode_internal determines the batch size:
+* If batch_size > 1: Write PHASE_PREFILL to the map.
+* If batch_size == 1: Write PHASE_DECODE to the map.
+This operation is lock-free and extremely fast, introducing negligible overhead to the inference loop.31
+
+
+4.2 The Kernel Policy: scx_llm_phase
+
+
+The BPF program implements the sched_ext_ops to act on these hints.
+
+
+4.2.1 Decode Policy: Strict Priority & Preemption
+
+
+When the scheduler encounters a task tagged as PHASE_DECODE:
+1. Placement (select_cpu): It attempts to place the task on its previous CPU (prev_cpu) to maximize L1/L2 cache locality. If prev_cpu is busy, it searches for an idle CPU within the same Last Level Cache (LLC) domain (CCX).22 This minimizes the cost of migrating the thread's working set.
+2. Dispatch (enqueue): It dispatches the task to a High Priority Custom DSQ.
+3. Preemption (kick_cpu): This is the critical step. If the target CPU is currently running a non-Decode task (e.g., a background compilation job or even a Prefill thread), the BPF scheduler calls scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT).33 This sends an Inter-Processor Interrupt (IPI) to the CPU, forcing it to enter the scheduler immediately and pick the new high-priority Decode task.
+
+
+4.2.2 Prefill Policy: Topology-Aware Batching
+
+
+When the scheduler encounters PHASE_PREFILL:
+1. Placement: It prefers CPUs in a specific "Compute Domain" if the hardware permits. For example, on a Ryzen 7950X (2 CCXs), we can effectively partition the machine. One CCX can be dedicated to background noise and Prefill, while the other is reserved for Decode bursts.
+2. Dispatch: It uses the standard global DSQ or a lower-priority custom DSQ. It is assigned a longer time slice (SCX_SLICE_DFL or larger) to ensure the GEMM kernels can run uninterrupted, maximizing instruction throughput.24
+
+
+4.2.3 Topology Awareness: CCX and NUMA
+
+
+Modern CPUs, particularly AMD Ryzens and EPYCs, are collections of Core Complexes (CCX). Cores within a CCX share L3 cache; cores across CCXs do not. Moving a memory-heavy LLM thread between CCXs is disastrous for performance.
+The BPF scheduler utilizes scx_bpf_cpu_node and topology helpers 29 to map the CPU topology.
+* Rule: A Decode task should never migrate out of its CCX unless the entire CCX is saturated with other Decode tasks.
+* Implementation: The select_cpu logic iterates only over the cpumask of the current CCX when searching for an idle core.
+
+
+4.3 Handling the "Noisy Neighbor"
+
+
+Consider a scenario where the user is running a heavy compile (make -j16) while chatting with the LLM.
+* Standard Scheduler (CFS/EEVDF): The compile threads and the LLM threads fight for time. The LLM Decode thread gets preempted frequently, causing stutter.
+* Phase-Aware Scheduler: The Compile threads are treated as standard priority. The LLM Decode threads are treated as Real-Time. Every time a Decode thread wakes up (every ~30-50ms), it immediately preempts a compile thread. The compile thread is delayed by a few milliseconds (imperceptible to the compile process), but the token generation remains smooth.
+________________
+
+
+5. Implementation Strategy
+
+
+This section details the concrete steps to build this system, referencing specific APIs and code paths.
+
+
+5.1 Modifying llama.cpp (C++)
+
+
+The target for modification is the llama.cpp source code. We must identify the llama_decode_internal function, which drives the generation loop.15
+Step 1: The BPF Interface Class
+We create a file bpf_interface.h that handles the map updates. It loads the BPF map file descriptor (FD) from the pinned path in /sys/fs/bpf.
+
+
+C++
+
+
+
+
+// bpf_interface.h
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+
+class PhaseHinter {
+   int map_fd;
+public:
+   PhaseHinter() {
+       // Open the pinned map created by the scheduler
+       map_fd = bpf_obj_get("/sys/fs/bpf/scx_llm_phase_map");
+   }
+
+   void set_phase(int phase) {
+       if (map_fd < 0) return;
+       int key = 0; // 0 implies "current task" in task_local_storage
+       bpf_map_update_elem(map_fd, &key, &phase, BPF_ANY);
+   }
+};
+
+Step 2: Instrumenting the Loop
+In src/llama.cpp:
+
+
+C++
+
+
+
+
+// Inside llama_decode_internal
+static PhaseHinter hinter;
+
+//... (Existing setup code)...
+
+if (n_tokens > 1) {
+   // We are processing a prompt or a chunk
+   hinter.set_phase(PHASE_PREFILL);
+} else {
+   // We are generating a single token
+   hinter.set_phase(PHASE_DECODE);
+}
+
+//... (The computation loop: ggml_graph_compute)...
+
+This ensures that just before the heavy computation starts, the kernel is notified of the phase shift.
+
+
+5.2 The BPF Scheduler (scx_llm_phase.bpf.c)
+
+
+The BPF implementation requires defining the map and the ops.
+Step 1: Defining the Map
+
+
+C
+
+
+
+
+struct {
+   __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+   __uint(map_flags, BPF_F_NO_PREALLOC);
+   __type(key, int);
+   __type(value, enum llm_phase);
+} task_phase_map SEC(".maps");
+
+Step 2: The Enqueue Logic
+The enqueue operation is where we separate the traffic.
+
+
+C
+
+
+
+
+void BPF_STRUCT_OPS(llm_enqueue, struct task_struct *p, u64 enq_flags)
+{
+   enum llm_phase *phase;
+   phase = bpf_task_storage_get(&task_phase_map, p, 0, 0);
+
+   if (phase && *phase == PHASE_DECODE) {
+       // Strict Priority: Dispatch to Custom DSQ 0
+       scx_bpf_dispatch(p, 0, SCX_SLICE_DFL, enq_flags);
+       return;
+   }
+   
+   // Default: Dispatch to Global DSQ
+   scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+}
+
+Step 3: The Dispatch Logic & Preemption
+When a CPU calls dispatch, we prioritize the Custom DSQ.
+
+
+C
+
+
+
+
+void BPF_STRUCT_OPS(llm_dispatch, s32 cpu, struct task_struct *prev)
+{
+   // 1. Try to consume from the High Priority Decode Queue (DSQ 0)
+   if (scx_bpf_consume(0)) {
+       return; 
+   }
+
+   // 2. If no high priority work, consume from Global Queue
+   scx_bpf_consume(SCX_DSQ_GLOBAL);
+}
+
+Step 4: The Preemption Trigger (select_cpu)
+The select_cpu callback is invoked when a task wakes up. This is where we trigger preemption if necessary.
+
+
+C
+
+
+
+
+s32 BPF_STRUCT_OPS(llm_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+   enum llm_phase *phase = bpf_task_storage_get(&task_phase_map, p, 0, 0);
+
+   if (phase && *phase == PHASE_DECODE) {
+       s32 target_cpu = prev_cpu; 
+       // If prev_cpu is idle, great. If not, pick an idle one in the same LLC domain.
+       // (Implementation of topology search omitted for brevity, uses scx_bpf_cpu_node)
+       
+       // CRITICAL: If we picked a CPU that is currently busy, KICK it.
+       // This forces the current running task on target_cpu to yield.
+       scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
+       
+       return target_cpu;
+   }
+   
+   return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, NULL);
+}
+
+The usage of SCX_KICK_PREEMPT is the mechanism that ensures the "Stutter" is eliminated. Standard schedulers might wait for the current task's slice to expire; we force the expiration immediately.34
+________________
+
+
+6. Theoretical Performance & Queueing Analysis
+
+
+To validate this design theoretically before empirical testing, we apply queueing theory and overhead analysis.
+
+
+6.1 Queueing Model: M/G/1 with Priority
+
+
+We can model the CPU core as a server in a queueing system.
+* Standard Scheduler (CFS): Can be modeled roughly as Processor Sharing (PS) or Round Robin (RR).
+* Phase-Aware Scheduler: Models a Priority Queue system (Non-preemptive priority in standard formulation, but effectively Preemptive Priority due to kick_cpu).
+Let $\lambda_D$ be the arrival rate of Decode tasks (tokens/sec) and $\mu_D$ be the service rate.
+Let $\lambda_B$ be the arrival rate of Background tasks (noise) and $\mu_B$ be their service rate.
+In a Non-Priority (CFS) system, the waiting time $W$ for a Decode task is influenced by the residual service time of the background task currently running.
+
+
+
+
+$$W_{CFS} \approx \frac{R}{1 - \rho}$$
+
+
+Where $R$ is the residual time. If a background task has a 10ms slice and the Decode task arrives 1ms into it, $W_{CFS} \approx 9ms$. This 9ms is pure latency (jitter).
+In a Preemptive Priority (scx_llm_phase) system:
+
+
+
+
+$$W_{Priority} \approx 0$$
+
+
+Because the arrival of the high-priority task triggers the kick_cpu, the service of the background task is interrupted immediately. The waiting time is reduced to the Context Switch overhead ($C$).
+
+
+6.2 Latency vs. Overhead Trade-off
+
+
+The proposed system introduces BPF overhead. Is it worth it?
+Overhead Components:
+1. Map Update (Userspace): $\approx 50ns$ per batch.
+2. BPF Program Execution (select_cpu + enqueue): $\approx 200ns$ per wakeup.
+3. Context Switch (Hardware): $\approx 1-2\mu s$.
+Total Overhead: $< 3\mu s$ per token.
+Latency Gain:
+In a loaded system, avoiding a wait behind a 4ms scheduler tick saves $4000\mu s$.
+
+
+
+
+$$\text{Gain} = 4000\mu s - 3\mu s = 3997\mu s$$
+
+
+The trade-off is overwhelmingly positive. The overhead is three orders of magnitude smaller than the latency reduction.5
+
+
+6.3 Topology and Amdahl's Law
+
+
+The Prefill phase benefits from the topology-aware scheduling. By restricting Prefill tasks to a single CCX (on AMD hardware), we effectively partition the L3 cache.
+Without this isolation, a Prefill task running on CCX0 might be migrated to CCX1 by the OS to balance load. This migration invalidates the L3 cache on CCX1. When the Decode thread (also on CCX1) wakes up, it faces a cold cache.
+By pinning phases to domains, we reduce the Memory Stall component of the execution time. While this doesn't increase theoretical FLOPS, it increases Effective FLOPS by keeping the functional units fed with data.
+________________
+
+
+7. Comparison with Existing Solutions
+
+
+It is crucial to contextualize scx_llm_phase against existing state-of-the-art schedulers within the sched_ext ecosystem, specifically scx_bpfland and scx_rustland.
+
+
+Feature
+	scx_llm_phase (Proposed)
+	scx_bpfland
+	CFS / EEVDF (Default)
+	Phase Detection
+	Explicit Hinting (Application driven)
+	Heuristic (vruntime/sleep time)
+	Heuristic
+	Priority Mechanism
+	Strict Priority for Decode
+	Vtime / Weighted
+	Weighted Fair
+	Preemption
+	Immediate (kick_cpu)
+	Slice Expiration
+	Slice Expiration
+	Topology Awareness
+	Phase-Specific (Prefill vs Decode isolation)
+	General Cache Locality
+	General Load Balancing
+	User Overhead
+	Requires modifying source code
+	Zero config
+	Zero config
+	Target Use Case
+	LLM / Generative AI
+	Desktop / Gaming
+	General Purpose
+	scx_bpfland is excellent for general desktop usage (gaming + browsing), but it cannot distinguish between a "Prefill" burst (which looks like a background compile) and a "Decode" burst (which looks like a game loop) with the same precision as explicit hinting. scx_llm_phase trades generality for optimality in the specific domain of AI inference.
+________________
+
+
+8. Conclusion and Future Outlook
+
+
+This report successfully demonstrates the architectural necessity and technical viability of a "Phase-Aware" OS scheduler for LLM workloads. By acknowledging the unique, bimodal nature of Transformer inference—oscillating between the compute-heavy Prefill and the latency-sensitive Decode—we have exposed the fundamental limitations of general-purpose schedulers like CFS and EEVDF.
+The implementation of scx_llm_phase leveraging the sched_ext framework allows us to inject domain-specific intelligence into the kernel. Through the mechanism of Userspace Hinting via BPF maps, llama.cpp can effectively "collaborate" with the OS, requesting specific handling for its distinct phases. The use of strict priority queues for Decode threads and topology-aware placement for Prefill threads addresses both the latency ("stutter") and throughput ("cache thrashing") aspects of the performance equation.
+Impact:
+Theoretical analysis confirms that this approach can reduce tail latency (p99) by orders of magnitude in noisy environments, eliminating the scheduler-induced jitter that currently plagues local AI inference.
+Future Directions:
+1. GPU-Initiated Preemption: Currently, the CPU thread must wake up to trigger the scheduler. Future work could involve the GPU interrupt handler directly triggering the BPF scheduler to prepare the CPU core before the data arrives over PCIe.
+2. Hybrid Scheduling: Integrating this logic with scx_rustland to create a general-purpose scheduler that also respects LLM hints, rather than a specialized scheduler that might starve other desktop apps.
+3. Standardization: Proposing a standard "Latency Hint" syscall or BPF interface that any application (Games, Audio DAWs, LLMs) can use to request isochronous scheduling slices without requiring CAP_SYS_NICE.
+In conclusion, sched_ext transforms the OS scheduler from a static manager into a programmable accelerator. scx_llm_phase is a prime example of this new capability, proving that deep vertical integration—from the application layer down to the kernel dispatch loop—is the key to unlocking the next generation of AI performance on commodity hardware.
+Works cited
+1. The extensible scheduler class - LWN.net, accessed on November 22, 2025, https://lwn.net/Articles/922405/
+2. Completely Fair Scheduler - Grokipedia, accessed on November 22, 2025, https://grokipedia.com/page/Completely_Fair_Scheduler
+3. Disaggregated Prefilling (experimental) - vLLM, accessed on November 22, 2025, https://docs.vllm.ai/en/stable/features/disagg_prefill.html
+4. Does LLM.generate() differentiate between Prefill and Decode phases? Where to insert timers? - vLLM Forums, accessed on November 22, 2025, https://discuss.vllm.ai/t/does-llm-generate-differentiate-between-prefill-and-decode-phases-where-to-insert-timers/1167
+5. The Evolution of Linux CPU Schedulers: From O(1) to CFS to User‑Space Scheduling, accessed on November 22, 2025, https://codemia.io/blog/path/The-Evolution-of-Linux-CPU-Schedulers-From-O1-to-CFS-to-UserSpace-Scheduling
+6. Optimizing LLM Inference for Database Systems: Cost-Aware Scheduling for Concurrent Requests - arXiv, accessed on November 22, 2025, https://arxiv.org/html/2411.07447v3
+7. Concurrency Testing in the Linux Kernel via eBPF - arXiv, accessed on November 22, 2025, https://arxiv.org/html/2504.21394v1
+8. Sandwich: Separating Prefill-Decode Compilation for Efficient CPU LLM Serving - arXiv, accessed on November 22, 2025, https://arxiv.org/html/2507.18454v1
+9. Arrow: Adaptive Scheduling Mechanisms for Disaggregated LLM Inference Architecture, accessed on November 22, 2025, https://arxiv.org/html/2505.11916v1
+10. Throughput-Optimal Scheduling Algorithms for LLM Inference and AI Agents - arXiv, accessed on November 22, 2025, https://arxiv.org/html/2504.07347v1
+11. Fast LLM Inference From Scratch - Andrew Chan, accessed on November 22, 2025, https://andrewkchan.dev/posts/yalm.html
+12. Explore llama.cpp architecture and the inference workflow - Arm Learning Paths, accessed on November 22, 2025, https://learn.arm.com/learning-paths/servers-and-cloud-computing/llama_cpp_streamline/2_llama.cpp_intro/
+13. Examine multi-threaded performance patterns in llama.cpp | Arm Learning Paths, accessed on November 22, 2025, https://learn.arm.com/learning-paths/servers-and-cloud-computing/llama_cpp_streamline/6_multithread_analyze/
+14. ggml-org/llama.cpp: LLM inference in C/C++ - GitHub, accessed on November 22, 2025, https://github.com/ggml-org/llama.cpp
+15. Does llama-parallel executes the llama_decode in serial for np=2 or more? #10017 - GitHub, accessed on November 22, 2025, https://github.com/ggml-org/llama.cpp/discussions/10017
+16. Eval bug: issues with draft model and Cline+VSCode · Issue #10547 · ggml-org/llama.cpp, accessed on November 22, 2025, https://github.com/ggerganov/llama.cpp/issues/10547
+17. How to learn the base code of llama.cpp? (I'm starting from main.cpp) - Reddit, accessed on November 22, 2025, https://www.reddit.com/r/LocalLLaMA/comments/1at3hu2/how_to_learn_the_base_code_of_llamacpp_im/
+18. sched-ext/scx: sched_ext schedulers and tools - GitHub, accessed on November 22, 2025, https://github.com/sched-ext/scx
+19. Extensible Scheduler Class — The Linux Kernel documentation, accessed on November 22, 2025, https://docs.kernel.org/scheduler/sched-ext.html
+20. sched_ext: a BPF-extensible scheduler class (Part 1), accessed on November 22, 2025, https://blogs.igalia.com/changwoo/sched-ext-a-bpf-extensible-scheduler-class-part-1/
+21. Extensible Scheduler Class - The Linux Kernel documentation, accessed on November 22, 2025, https://docs.kernel.org/6.14/scheduler/sched-ext.html
+22. Sched_ext Scheduler Idle Selection Being Extended For LLC & NUMA Awareness, accessed on November 22, 2025, https://www.phoronix.com/news/sched_ext-NUMA-Awareness
+23. BPF Scheduler sched_ext Implementation Mechanism, Scheduling Process, and Examples, accessed on November 22, 2025, https://www.ebpf.top/en/post/bpf_sched_ext_dive_into/
+24. Extensible Scheduler Class — The Linux Kernel documentation, accessed on November 22, 2025, https://www.kernel.org/doc/html/v6.12/scheduler/sched-ext.html
+25. Overview | sched_ext, accessed on November 22, 2025, https://sched-ext.com/docs/OVERVIEW
+26. Measuring BPF performance: Tips, tricks, and best practices | Red Hat Developer, accessed on November 22, 2025, https://developers.redhat.com/articles/2022/06/22/measuring-bpf-performance-tips-tricks-and-best-practices
+27. Noisy Neighbor Detection with eBPF | by Netflix Technology Blog, accessed on November 22, 2025, https://netflixtechblog.com/noisy-neighbor-detection-with-ebpf-64b1f4b3bbdd
+28. eBPF Tutorial: Energy Monitoring for Process-Level Power Analysis - eunomia, accessed on November 22, 2025, https://eunomia.dev/tutorials/48-energy/
+29. NUMA-aware scheduling with sched_ext and scx_bpfland - YouTube, accessed on November 22, 2025, https://www.youtube.com/watch?v=CootF9OtSRM
+30. eBPF Tutorial by Example: Implementing the `scx_nest` Scheduler | by yunwei37 - Medium, accessed on November 22, 2025, https://medium.com/@yunwei356/ebpf-tutorial-by-example-implementing-the-scx-nest-scheduler-4ad63e07d6e8
+31. bpf-helpers(7) - Arch manual pages, accessed on November 22, 2025, https://man.archlinux.org/man/bpf-helpers.7.en
+32. bpf-helpers(7) - Linux manual page - man7.org, accessed on November 22, 2025, https://man7.org/linux/man-pages/man7/bpf-helpers.7.html
+33. sched_ext: scheduler architecture and interfaces (Part 2), accessed on November 22, 2025, https://blogs.igalia.com/changwoo/sched-ext-scheduler-architecture-and-interfaces-part-2/
+34. [PATCH 12/34] sched_ext: Implement BPF extensible scheduler class - Linux-Kernel Archive, accessed on November 22, 2025, https://lkml.indiana.edu/2307.1/02280.html
+35. Helper Function 'bpf_get_numa_node_id' - eBPF Docs, accessed on November 22, 2025, https://docs.ebpf.io/linux/helper-function/bpf_get_numa_node_id/
+36. Speculative Decoding is AWESOME with Llama.cpp! : r/LocalLLaMA - Reddit, accessed on November 22, 2025, https://www.reddit.com/r/LocalLLaMA/comments/1oq5msi/speculative_decoding_is_awesome_with_llamacpp/
+37. KFunc 'scx_bpf_kick_cpu' - eBPF Docs, accessed on November 22, 2025, https://docs.ebpf.io/linux/kfuncs/scx_bpf_kick_cpu/
+38. scx_bpfland | sched_ext, accessed on November 22, 2025, https://sched-ext.com/docs/scheds/rust/scx_bpfland

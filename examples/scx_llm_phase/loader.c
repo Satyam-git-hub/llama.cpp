@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
@@ -52,6 +53,12 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     printf("Pinned map to /sys/fs/bpf/scx_llm_phase_map\n");
+    
+    // Allow non-root users (like the one running llama.cpp) to update the map
+    if (chmod("/sys/fs/bpf/scx_llm_phase_map", 0666) < 0) {
+        fprintf(stderr, "Failed to chmod map: %m\n");
+        // Don't exit, just warn
+    }
 
     // Attach the scheduler
     struct bpf_link *link = bpf_map__attach_struct_ops(skel->maps.llm_ops);

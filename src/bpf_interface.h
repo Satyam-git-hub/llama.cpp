@@ -7,6 +7,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
 
 // Phase enum must match the BPF program
 enum llm_phase {
@@ -24,9 +30,9 @@ public:
         // We use bpf_obj_get to get the FD of the pinned map
         map_fd = bpf_obj_get("/sys/fs/bpf/scx_llm_phase_map");
         if (map_fd < 0) {
-            // It's expected to fail if the scheduler is not loaded
-            // We can just ignore it, or print a warning once
-            // fprintf(stderr, "PhaseHinter: Failed to open BPF map: %m\n");
+            fprintf(stderr, "PhaseHinter: Failed to open BPF map: %m\n");
+        } else {
+            fprintf(stderr, "PhaseHinter: Successfully opened BPF map (fd=%d)\n", map_fd);
         }
     }
 
@@ -36,47 +42,43 @@ public:
         }
     }
 
+    int last_phase = -1;
+
     void set_phase(int phase) {
         if (map_fd < 0) return;
+        if (phase == last_phase) return;
 
-        int key = 0; // 0 implies "current task" in task_local_storage if we were using that, 
-                     // but for BPF_MAP_TYPE_TASK_STORAGE, the key is actually the task_fd or 0 for current?
-                     // Wait, for task_storage, the key in userspace bpf_map_update_elem is the FD of the task.
-                     // Passing 0 usually doesn't work for task_storage from userspace unless we have a specific helper.
-                     // Actually, updating task_storage from userspace is tricky.
-                     // Usually we use a pid_iter or similar.
-                     // BUT, if we use a simple ARRAY map or HASH map keyed by PID, it's easier.
-                     // The research paper said "Task Local Storage".
-                     // "We utilize BPF_MAP_TYPE_TASK_STORAGE... key is the task (thread) itself"
-                     // Updating task storage from userspace requires getting the task FD.
-                     // pidfd_open() can get a FD for the current thread/process.
+        // For TASK_STORAGE, we need a pidfd to the task (thread)
+        // We target the process leader (TGID) so that all threads can share the hint
+        pid_t tgid = getpid();
+        int task_fd = syscall(SYS_pidfd_open, tgid, 0);
         
-        // Let's try to get a FD for the current thread.
-        // On Linux, gettid() gives the thread ID.
-        // We can use /proc/self/task/<tid>/... or just pidfd_open if available.
+        if (task_fd < 0) {
+             static bool warned_open = false;
+             if (!warned_open) {
+                 fprintf(stderr, "PhaseHinter: Failed to get pidfd for TGID %d: %m\n", tgid);
+                 warned_open = true;
+             }
+             return;
+        } else {
+             static bool logged_open = false;
+             if (!logged_open) {
+                 fprintf(stderr, "PhaseHinter: Successfully got pidfd %d for TGID %d\n", task_fd, tgid);
+                 logged_open = true;
+             }
+        }
         
-        // However, for simplicity and to match the paper's "userspace hook", 
-        // maybe they meant a simple map keyed by PID/TID?
-        // "In llama.cpp, we introduce a lightweight wrapper around bpf_map_update_elem."
-        
-        // If it is indeed TASK_STORAGE, we need a FD to the task.
-        // Let's assume we can get it via open("/proc/self/task/<tid>", O_RDONLY).
-        
-        // But wait, if we use a pinned map, we can just update it.
-        
-        // Let's implement getting the FD for the current thread.
-        // Or, if the BPF side uses a HASH map keyed by u32 (tid), that's easier.
-        // The paper says: "We utilize BPF_MAP_TYPE_TASK_STORAGE".
-        // And "In llama.cpp... bpf_map_update_elem(map_fd, &key, &phase, BPF_ANY)".
-        // If key is 0, that implies the map might be a special type or they are simplifying.
-        
-        // Standard libbpf way to update task storage for *current* task from userspace:
-        // You need a FD representing the task.
-        
-        int task_fd = open("/proc/thread-self", O_RDONLY);
-        if (task_fd < 0) return;
-        
-        bpf_map_update_elem(map_fd, &task_fd, &phase, BPF_ANY);
+        if (bpf_map_update_elem(map_fd, &task_fd, &phase, BPF_ANY) < 0) {
+             static bool warned_update = false;
+             if (!warned_update) {
+                 fprintf(stderr, "PhaseHinter: Failed to update map for task_fd %d: %m\n", task_fd);
+                 warned_update = true;
+             }
+        } else {
+             // Log the update to prove it happened
+             fprintf(stderr, "PhaseHinter: Updated map for TGID %d to phase %d\n", tgid, phase);
+             last_phase = phase;
+        }
         
         close(task_fd);
     }
